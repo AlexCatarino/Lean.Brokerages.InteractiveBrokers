@@ -5519,20 +5519,47 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 {
                     try
                     {
-                        // We won't trigger a restart if the automater was already started in the meantime
-                        // or if there was an error starting it. If it's recoverable, it will be restarted
-                        // by the user action somewhere else
-                        if (_ibAutomater.IsRunning())
-                        {
-                            Log.Trace("InteractiveBrokersBrokerage.OnIbAutomaterExited(): IBAutomater is already running, skipping restart.");
-                            return;
-                        }
-
+                        // We won't trigger a restart if there was an error starting the automater.
+                        // If it's recoverable, it will be restarted by the user action somewhere else
                         var lastResult = _ibAutomater.GetLastStartResult();
                         if (lastResult.HasError)
                         {
                             Log.Trace("InteractiveBrokersBrokerage.OnIbAutomaterExited(): last IBAutomater start had error, skipping restart.");
                             return;
+                        }
+
+                        // IBAutomater reports an exit even when the replacement gateway it started is still
+                        // alive, and that gateway can be accepting no API connections, so a live process is not
+                        // evidence that we can trade: only the connection is
+                        if (_ibAutomater.IsRunning())
+                        {
+                            if (IsConnected)
+                            {
+                                Log.Trace("InteractiveBrokersBrokerage.OnIbAutomaterExited(): IBAutomater is already running and connected, skipping restart.");
+                                return;
+                            }
+
+                            Log.Trace("InteractiveBrokersBrokerage.OnIbAutomaterExited(): IBAutomater is running but we are not connected, reconnecting...");
+                            try
+                            {
+                                // cheap when the gateway is healthy and only the API client was lost
+                                Connect();
+                            }
+                            catch (Exception connectException)
+                            {
+                                Log.Trace($"InteractiveBrokersBrokerage.OnIbAutomaterExited(): error in Connect(): {connectException.Message}");
+                            }
+
+                            if (IsConnected)
+                            {
+                                return;
+                            }
+
+                            // the gateway is up but unusable, stop it so a new one is started below. This makes
+                            // IBAutomater report another exit, scheduling a recovery we do not need, it will
+                            // find us connected by then and skip
+                            Log.Trace("InteractiveBrokersBrokerage.OnIbAutomaterExited(): the gateway is not accepting connections, stopping it...");
+                            _ibAutomater.Stop();
                         }
 
                         Log.Trace("InteractiveBrokersBrokerage.OnIbAutomaterExited(): restarting...");
