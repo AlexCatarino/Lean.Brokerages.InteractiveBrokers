@@ -439,13 +439,22 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             {
                 if (!IsConnected)
                 {
-                    Log.Trace($"InteractiveBrokersBrokerage.PlaceOrder(): Symbol: {order.Symbol.Value} Quantity: {order.Quantity}. Id: {order.Id}");
-                    OnMessage(
-                        new BrokerageMessageEvent(
-                            BrokerageMessageType.Warning,
-                            "PlaceOrderWhenDisconnected",
-                            "Orders cannot be submitted when disconnected."));
-                    return false;
+                    const string message = "Orders cannot be submitted when disconnected.";
+
+                    Log.Trace($"InteractiveBrokersBrokerage.PlaceOrder(): {message} Symbol: {order.Symbol.Value} Quantity: {order.Quantity}. Id: {order.Id}");
+                    OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "PlaceOrderWhenDisconnected", message));
+
+                    // invalidate it here with the actual reason, the transaction handler would only say
+                    // "Brokerage failed to place orders: [id]". Reporting success keeps it from invalidating
+                    // the order again and raising a duplicate event for the same rejection
+                    OnOrderEvents([
+                        new (order, DateTime.UtcNow, OrderFee.Zero)
+                        {
+                            Status = OrderStatus.Invalid,
+                            Message = message
+                        }
+                    ]);
+                    return true;
                 }
 
                 IBPlaceOrder(order, true);
@@ -1047,7 +1056,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 RestoreDataSubscriptions();
 
                 // we need to tell the DefaultBrokerageMessageHandler we are connected else he will kill us
-                OnMessage(BrokerageMessageEvent.Reconnected("Connect() finished successfully"));
+                OnReconnected("Connect() finished successfully");
             }
             else
             {
@@ -1063,26 +1072,90 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 return true;
             }
 
-            if (!_isDisposeCalled &&
-                !_ibAutomater.IsWithinScheduledServerResetTimes() &&
-                IsConnected &&
-                // do not run heart beat if we are close to daily restarts
-                DateTime.Now.TimeOfDay < _heartBeatTimeLimit &&
-                // do not run heart beat if we are restarting
-                !IsRestartInProgress())
+            if (IsWithinExpectedDisconnectionWindow(out var reason))
             {
-                _currentTimeEvent.Reset();
-                // request current time to the server
-                _client.ClientSocket.reqCurrentTime();
-                var result = _currentTimeEvent.WaitOne(Time.GetSecondUnevenWait(waitTimeMs), _cancellationTokenSource.Token);
-                if (!result)
+                if (!IsConnected)
                 {
-                    Log.Error("InteractiveBrokersBrokerage.HeartBeat(): failed!", overrideMessageFloodProtection: true);
+                    Log.Trace($"InteractiveBrokersBrokerage.HeartBeat(): not connected, but it is expected: {reason}");
                 }
-                return result;
+                // expected
+                return true;
             }
-            // expected
-            return true;
+
+            if (!IsConnected)
+            {
+                // a dropped connection with nothing to account for it is a real loss, reporting it as a healthy
+                // beat is what kept a gateway restart that never came back unnoticed for three days
+                Log.Error("InteractiveBrokersBrokerage.HeartBeat(): not connected!", overrideMessageFloodProtection: true);
+                return false;
+            }
+
+            _currentTimeEvent.Reset();
+            // request current time to the server
+            _client.ClientSocket.reqCurrentTime();
+            var result = _currentTimeEvent.WaitOne(Time.GetSecondUnevenWait(waitTimeMs), _cancellationTokenSource.Token);
+            if (!result)
+            {
+                Log.Error("InteractiveBrokersBrokerage.HeartBeat(): failed!", overrideMessageFloodProtection: true);
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// Determines whether losing the connection is currently expected, so it is neither probed nor reported.
+        /// </summary>
+        /// <param name="reason">Why the disconnection is expected, null when it is not</param>
+        private bool IsWithinExpectedDisconnectionWindow(out string reason)
+        {
+            reason = null;
+            if (_isDisposeCalled)
+            {
+                reason = "we are disposed";
+            }
+            else if (_stateManager.IsConnecting)
+            {
+                // connecting can take minutes when it needs a 2FA confirmation
+                reason = "a connection attempt is in progress";
+            }
+            else if (_ibAutomater.IsWithinScheduledServerResetTimes())
+            {
+                reason = "within the IB scheduled server reset times";
+            }
+            else if (DateTime.Now.TimeOfDay >= _heartBeatTimeLimit)
+            {
+                reason = "close to the gateway daily restart";
+            }
+            else if (IsRestartInProgress())
+            {
+                reason = "a gateway restart is in progress";
+            }
+
+            return reason != null;
+        }
+
+        /// <summary>
+        /// Tells the brokerage message handler the connection was lost, once per disconnection: it restarts its
+        /// countdown to stop the algorithm on every disconnect message, so repeating it would defer the shutdown.
+        /// </summary>
+        private void OnDisconnected(string message)
+        {
+            if (_stateManager.DisconnectReported)
+            {
+                return;
+            }
+            _stateManager.DisconnectReported = true;
+
+            OnMessage(BrokerageMessageEvent.Disconnected(message));
+        }
+
+        /// <summary>
+        /// Tells the brokerage message handler the connection was restored, cancelling any pending shutdown.
+        /// </summary>
+        private void OnReconnected(string message)
+        {
+            _stateManager.DisconnectReported = false;
+
+            OnMessage(BrokerageMessageEvent.Reconnected(message));
         }
 
         private void RunHeartBeatThread()
@@ -1101,7 +1174,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                             if (!HeartBeat(waitTimeMs * 3))
                             {
                                 // we emit the disconnected event so that if the re connection below fails it will kill the algorithm
-                                OnMessage(BrokerageMessageEvent.Disconnected("Connection with Interactive Brokers lost. Heart beat failed."));
+                                OnDisconnected("Connection with Interactive Brokers lost. Heart beat failed.");
                                 try
                                 {
                                     Disconnect();
@@ -1109,7 +1182,16 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                                 catch (Exception)
                                 {
                                 }
-                                Connect();
+
+                                try
+                                {
+                                    Connect();
+                                }
+                                catch (Exception exception)
+                                {
+                                    // the heart beat is our only watchdog, a failed recovery must not end the loop
+                                    Log.Error(exception, "InteractiveBrokersBrokerage.RunHeartBeatThread(): reconnection attempt failed");
+                                }
                             }
                             else
                             {
@@ -2094,7 +2176,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             else if (errorCode == 1102)
             {
                 // Connectivity between IB and TWS has been restored - data maintained.
-                OnMessage(BrokerageMessageEvent.Reconnected(errorMsg));
+                OnReconnected(errorMsg);
 
                 _stateManager.Disconnected1100Fired = false;
                 return;
@@ -2102,7 +2184,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             else if (errorCode == 1101)
             {
                 // Connectivity between IB and TWS has been restored - data lost.
-                OnMessage(BrokerageMessageEvent.Reconnected(errorMsg));
+                OnReconnected(errorMsg);
 
                 _stateManager.Disconnected1100Fired = false;
 
@@ -2253,9 +2335,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 if (!_stateManager.PreviouslyInResetTime)
                 {
                     // if we were disconnected and we're not within the reset times, send the error event
-                    OnMessage(BrokerageMessageEvent.Disconnected("Connection with Interactive Brokers lost. " +
-                                                                 "This could be because of internet connectivity issues or a log in from another location."
-                        ));
+                    OnDisconnected("Connection with Interactive Brokers lost. " +
+                                   "This could be because of internet connectivity issues or a log in from another location.");
                 }
             }
             else
@@ -5216,7 +5297,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 {
                     _ibAutomater.Stop();
                     var message = "2FA authentication confirmation required to reconnect.";
-                    OnMessage(BrokerageMessageEvent.Disconnected(message));
+                    OnDisconnected(message);
                     OnMessage(new BrokerageMessageEvent(BrokerageMessageType.ActionRequired, "2FAAuthRequired", message));
                 });
             }
