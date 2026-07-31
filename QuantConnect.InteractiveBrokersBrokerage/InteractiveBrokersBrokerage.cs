@@ -125,6 +125,15 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
         private CancellationTokenSource _gatewayRestartTokenSource;
 
+        // waiting before restarting the exited gateway, the restart token is already cancelled by then
+        private volatile bool _gatewayRestartPending;
+
+        // we stopped the gateway ourselves, its exit must not schedule another restart
+        private volatile bool _stoppingGatewayForRestart;
+
+        // IsConnected is false while connecting, so it does not guard against a second concurrent attempt
+        private readonly object _connectLock = new object();
+
         private int _port;
         private string _account;
         private string _host;
@@ -433,30 +442,23 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// </summary>
         /// <param name="order">The order to be placed</param>
         /// <returns>True if the request for a new order has been placed, false otherwise</returns>
+        /// <exception cref="InvalidOperationException">We are disconnected, the message carries the reason</exception>
         public override bool PlaceOrder(Order order)
         {
+            // outside of the try below on purpose: the transaction handler appends the exception message to its
+            // generic "Brokerage failed to place orders: [id]", catching it here would lose the reason
+            if (!IsConnected)
+            {
+                const string message = "Orders cannot be submitted when disconnected.";
+
+                Log.Trace($"InteractiveBrokersBrokerage.PlaceOrder(): {message} Symbol: {order.Symbol.Value} Quantity: {order.Quantity}. Id: {order.Id}");
+                OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "PlaceOrderWhenDisconnected", message));
+
+                throw new InvalidOperationException(message);
+            }
+
             try
             {
-                if (!IsConnected)
-                {
-                    const string message = "Orders cannot be submitted when disconnected.";
-
-                    Log.Trace($"InteractiveBrokersBrokerage.PlaceOrder(): {message} Symbol: {order.Symbol.Value} Quantity: {order.Quantity}. Id: {order.Id}");
-                    OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "PlaceOrderWhenDisconnected", message));
-
-                    // invalidate it here with the actual reason, the transaction handler would only say
-                    // "Brokerage failed to place orders: [id]". Reporting success keeps it from invalidating
-                    // the order again and raising a duplicate event for the same rejection
-                    OnOrderEvents([
-                        new (order, DateTime.UtcNow, OrderFee.Zero)
-                        {
-                            Status = OrderStatus.Invalid,
-                            Message = message
-                        }
-                    ]);
-                    return true;
-                }
-
                 IBPlaceOrder(order, true);
                 return true;
             }
@@ -858,209 +860,217 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// </summary>
         public override void Connect()
         {
-            if (IsConnected || _isDisposeCalled)
+            // the heart beat, the gateway restart continuation and the automater events can all ask for a
+            // connection at once: two eConnect calls leak a message processing thread and one caller's
+            // Disconnect() kills the other's fresh socket
+            lock (_connectLock)
             {
-                return;
-            }
-
-            Log.Trace("InteractiveBrokersBrokerage.Connect(): not connected, start connecting now...");
-
-            var lastAutomaterStartResult = _ibAutomater.GetLastStartResult();
-            if (lastAutomaterStartResult.HasError)
-            {
-                lastAutomaterStartResult = _ibAutomater.Start(false);
-                CheckIbAutomaterError(lastAutomaterStartResult);
-                // There was an error but we did not throw, must be another 2FA timeout, we can't continue
-                if (lastAutomaterStartResult.HasError)
+                if (IsConnected || _isDisposeCalled)
                 {
-                    // we couldn't start IBAutomater, so we cannot connect
-                    OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "IBAutomaterWarning", $"Unable to restart IBAutomater: {lastAutomaterStartResult.ErrorMessage}"));
                     return;
                 }
-            }
 
-            _stateManager.IsConnecting = true;
+                Log.Trace("InteractiveBrokersBrokerage.Connect(): not connected, start connecting now...");
 
-            var attempt = 1;
-            const int maxAttempts = 7;
-
-            var subscribedSymbolsCount = _subscriptionManager.GetSubscribedSymbols().Count();
-            if (subscribedSymbolsCount > 0)
-            {
-                Log.Trace($"InteractiveBrokersBrokerage.Connect(): Data subscription count {subscribedSymbolsCount}, restoring data subscriptions is required");
-            }
-
-            // While not disposed instead of while(true). This could be happening in a different thread than the dispose call, so let's be safe.
-            while (!_isDisposeCalled)
-            {
-                try
+                var lastAutomaterStartResult = _ibAutomater.GetLastStartResult();
+                if (lastAutomaterStartResult.HasError)
                 {
-                    Log.Trace("InteractiveBrokersBrokerage.Connect(): Attempting to connect ({0}/{1}) ...", attempt, maxAttempts);
-
-                    // we're going to receive fresh values for all account data, so we clear all
-                    _accountData.Clear();
-
-                    // if message processing thread is still running, wait until it terminates
-                    Disconnect();
-
-                    // At initial startup or after a gateway restart, we need to wait for the gateway to be ready for a connect request.
-                    // Attempting to connect to the socket too early will get a SocketException: Connection refused.
-                    if (_cancellationTokenSource.Token.WaitHandle.WaitOne(TimeSpan.FromMilliseconds(2500)))
+                    lastAutomaterStartResult = _ibAutomater.Start(false);
+                    CheckIbAutomaterError(lastAutomaterStartResult);
+                    // There was an error but we did not throw, must be another 2FA timeout, we can't continue
+                    if (lastAutomaterStartResult.HasError)
                     {
-                        break;
+                        // we couldn't start IBAutomater, so we cannot connect
+                        OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "IBAutomaterWarning", $"Unable to restart IBAutomater: {lastAutomaterStartResult.ErrorMessage}"));
+                        return;
                     }
+                }
 
-                    _waitForNextValidId.Reset();
-                    _connectEvent.Reset();
+                // a new socket makes any pending 1100 stale, leaving it set keeps IsConnected false below
+                _stateManager.Disconnected1100Fired = false;
+                _stateManager.IsConnecting = true;
 
-                    // we're going to try and connect several times, if successful break
-                    Log.Trace("InteractiveBrokersBrokerage.Connect(): calling _client.ClientSocket.eConnect()");
-                    _client.ClientSocket.eConnect(_host, _port, ClientId);
+                var attempt = 1;
+                const int maxAttempts = 7;
 
-                    if (!_connectEvent.WaitOne(TimeSpan.FromSeconds(15)))
+                var subscribedSymbolsCount = _subscriptionManager.GetSubscribedSymbols().Count();
+                if (subscribedSymbolsCount > 0)
+                {
+                    Log.Trace($"InteractiveBrokersBrokerage.Connect(): Data subscription count {subscribedSymbolsCount}, restoring data subscriptions is required");
+                }
+
+                // While not disposed instead of while(true). This could be happening in a different thread than the dispose call, so let's be safe.
+                while (!_isDisposeCalled)
+                {
+                    try
                     {
-                        Log.Error("InteractiveBrokersBrokerage.Connect(): timeout waiting for connect callback");
-                    }
+                        Log.Trace("InteractiveBrokersBrokerage.Connect(): Attempting to connect ({0}/{1}) ...", attempt, maxAttempts);
 
-                    // create the message processing thread
-                    var reader = new EReader(_client.ClientSocket, _signal);
-                    reader.Start();
+                        // we're going to receive fresh values for all account data, so we clear all
+                        _accountData.Clear();
 
-                    _messageProcessingThread = new Thread(() =>
-                    {
-                        Log.Trace("InteractiveBrokersBrokerage.Connect(): IB message processing thread started: #" + Thread.CurrentThread.ManagedThreadId);
+                        // if message processing thread is still running, wait until it terminates
+                        Disconnect();
 
-                        while (_client.ClientSocket.IsConnected())
+                        // At initial startup or after a gateway restart, we need to wait for the gateway to be ready for a connect request.
+                        // Attempting to connect to the socket too early will get a SocketException: Connection refused.
+                        if (_cancellationTokenSource.Token.WaitHandle.WaitOne(TimeSpan.FromMilliseconds(2500)))
                         {
-                            try
+                            break;
+                        }
+
+                        _waitForNextValidId.Reset();
+                        _connectEvent.Reset();
+
+                        // we're going to try and connect several times, if successful break
+                        Log.Trace("InteractiveBrokersBrokerage.Connect(): calling _client.ClientSocket.eConnect()");
+                        _client.ClientSocket.eConnect(_host, _port, ClientId);
+
+                        if (!_connectEvent.WaitOne(TimeSpan.FromSeconds(15)))
+                        {
+                            Log.Error("InteractiveBrokersBrokerage.Connect(): timeout waiting for connect callback");
+                        }
+
+                        // create the message processing thread
+                        var reader = new EReader(_client.ClientSocket, _signal);
+                        reader.Start();
+
+                        _messageProcessingThread = new Thread(() =>
+                        {
+                            Log.Trace("InteractiveBrokersBrokerage.Connect(): IB message processing thread started: #" + Thread.CurrentThread.ManagedThreadId);
+
+                            while (_client.ClientSocket.IsConnected())
                             {
-                                _signal.waitForSignal();
-                                reader.processMsgs();
+                                try
+                                {
+                                    _signal.waitForSignal();
+                                    reader.processMsgs();
+                                }
+                                catch (Exception error)
+                                {
+                                    // error in message processing thread, log error and disconnect
+                                    Log.Error("InteractiveBrokersBrokerage.Connect(): Error in message processing thread #" + Thread.CurrentThread.ManagedThreadId + ": " + error);
+                                }
                             }
-                            catch (Exception error)
+
+                            Log.Trace("InteractiveBrokersBrokerage.Connect(): IB message processing thread ended: #" + Thread.CurrentThread.ManagedThreadId);
+                        })
+                        { IsBackground = true };
+
+                        _messageProcessingThread.Start();
+
+                        // pause for a moment to receive next valid ID message from gateway
+                        if (!_waitForNextValidId.WaitOne(15000))
+                        {
+                            // no response, disconnect and retry
+                            Disconnect();
+
+                            // max out at 5 attempts to connect ~1 minute
+                            if (attempt++ < maxAttempts)
                             {
-                                // error in message processing thread, log error and disconnect
-                                Log.Error("InteractiveBrokersBrokerage.Connect(): Error in message processing thread #" + Thread.CurrentThread.ManagedThreadId + ": " + error);
+                                Thread.Sleep(1000);
+                                continue;
+                            }
+
+                            throw new TimeoutException("InteractiveBrokersBrokerage.Connect(): Operation took longer than 15 seconds.");
+                        }
+
+                        Log.Trace("InteractiveBrokersBrokerage.Connect(): IB next valid id received.");
+
+                        if (!_client.Connected) throw new Exception("InteractiveBrokersBrokerage.Connect(): Connection returned but was not in connected state.");
+
+                        // request account information for logging purposes
+                        var group = string.IsNullOrEmpty(_financialAdvisorsGroupFilter) ? "All" : _financialAdvisorsGroupFilter;
+                        _client.ClientSocket.reqAccountSummary(GetNextId(), group, "AccountType");
+                        _client.ClientSocket.reqManagedAccts();
+                        _client.ClientSocket.reqFamilyCodes();
+
+                        if (IsFinancialAdvisor)
+                        {
+                            if (!DownloadFinancialAdvisorAccount())
+                            {
+                                Log.Trace("InteractiveBrokersBrokerage.Connect(): DownloadFinancialAdvisorAccount failed.");
+
+                                Disconnect();
+
+                                if (_accountHoldingsLastException != null)
+                                {
+                                    // if an exception was thrown during account download, do not retry but exit immediately
+                                    attempt = maxAttempts;
+                                    throw new Exception(_accountHoldingsLastException.Message, _accountHoldingsLastException);
+                                }
+
+                                if (attempt++ < maxAttempts)
+                                {
+                                    Thread.Sleep(1000);
+                                    continue;
+                                }
+
+                                throw new TimeoutException("InteractiveBrokersBrokerage.Connect(): DownloadFinancialAdvisorAccount failed.");
+                            }
+                        }
+                        else
+                        {
+                            if (!DownloadAccount())
+                            {
+                                Log.Trace($"InteractiveBrokersBrokerage.Connect(): DownloadAccount failed, attempt {attempt}");
+
+                                Disconnect();
+
+                                if (_accountHoldingsLastException != null)
+                                {
+                                    // if an exception was thrown during account download, do not retry but exit immediately
+                                    attempt = maxAttempts;
+                                    throw new Exception(_accountHoldingsLastException.Message, _accountHoldingsLastException);
+                                }
+
+                                if (attempt++ < maxAttempts)
+                                {
+                                    Thread.Sleep(1000);
+                                    continue;
+                                }
+
+                                throw new TimeoutException("InteractiveBrokersBrokerage.Connect(): DownloadAccount failed.");
                             }
                         }
 
-                        Log.Trace("InteractiveBrokersBrokerage.Connect(): IB message processing thread ended: #" + Thread.CurrentThread.ManagedThreadId);
-                    })
-                    { IsBackground = true };
+                        // enable logging at Warning level
+                        _client.ClientSocket.setServerLogLevel(3);
 
-                    _messageProcessingThread.Start();
-
-                    // pause for a moment to receive next valid ID message from gateway
-                    if (!_waitForNextValidId.WaitOne(15000))
+                        break;
+                    }
+                    catch (Exception err)
                     {
-                        // no response, disconnect and retry
-                        Disconnect();
-
                         // max out at 5 attempts to connect ~1 minute
                         if (attempt++ < maxAttempts)
                         {
-                            Thread.Sleep(1000);
+                            Thread.Sleep(15000);
                             continue;
                         }
+                        _stateManager.IsConnecting = false;
 
-                        throw new TimeoutException("InteractiveBrokersBrokerage.Connect(): Operation took longer than 15 seconds.");
+                        // we couldn't connect after several attempts, log the error and throw an exception
+                        Log.Error(err);
+
+                        throw;
                     }
-
-                    Log.Trace("InteractiveBrokersBrokerage.Connect(): IB next valid id received.");
-
-                    if (!_client.Connected) throw new Exception("InteractiveBrokersBrokerage.Connect(): Connection returned but was not in connected state.");
-
-                    // request account information for logging purposes
-                    var group = string.IsNullOrEmpty(_financialAdvisorsGroupFilter) ? "All" : _financialAdvisorsGroupFilter;
-                    _client.ClientSocket.reqAccountSummary(GetNextId(), group, "AccountType");
-                    _client.ClientSocket.reqManagedAccts();
-                    _client.ClientSocket.reqFamilyCodes();
-
-                    if (IsFinancialAdvisor)
-                    {
-                        if (!DownloadFinancialAdvisorAccount())
-                        {
-                            Log.Trace("InteractiveBrokersBrokerage.Connect(): DownloadFinancialAdvisorAccount failed.");
-
-                            Disconnect();
-
-                            if (_accountHoldingsLastException != null)
-                            {
-                                // if an exception was thrown during account download, do not retry but exit immediately
-                                attempt = maxAttempts;
-                                throw new Exception(_accountHoldingsLastException.Message, _accountHoldingsLastException);
-                            }
-
-                            if (attempt++ < maxAttempts)
-                            {
-                                Thread.Sleep(1000);
-                                continue;
-                            }
-
-                            throw new TimeoutException("InteractiveBrokersBrokerage.Connect(): DownloadFinancialAdvisorAccount failed.");
-                        }
-                    }
-                    else
-                    {
-                        if (!DownloadAccount())
-                        {
-                            Log.Trace($"InteractiveBrokersBrokerage.Connect(): DownloadAccount failed, attempt {attempt}");
-
-                            Disconnect();
-
-                            if (_accountHoldingsLastException != null)
-                            {
-                                // if an exception was thrown during account download, do not retry but exit immediately
-                                attempt = maxAttempts;
-                                throw new Exception(_accountHoldingsLastException.Message, _accountHoldingsLastException);
-                            }
-
-                            if (attempt++ < maxAttempts)
-                            {
-                                Thread.Sleep(1000);
-                                continue;
-                            }
-
-                            throw new TimeoutException("InteractiveBrokersBrokerage.Connect(): DownloadAccount failed.");
-                        }
-                    }
-
-                    // enable logging at Warning level
-                    _client.ClientSocket.setServerLogLevel(3);
-
-                    break;
                 }
-                catch (Exception err)
+                _stateManager.IsConnecting = false;
+
+                // if we reached here we should be connected, check just in case
+                if (IsConnected)
                 {
-                    // max out at 5 attempts to connect ~1 minute
-                    if (attempt++ < maxAttempts)
-                    {
-                        Thread.Sleep(15000);
-                        continue;
-                    }
-                    _stateManager.IsConnecting = false;
+                    _pastFirstConnection = true;
+                    Log.Trace("InteractiveBrokersBrokerage.Connect(): Restoring data subscriptions...");
+                    RestoreDataSubscriptions();
 
-                    // we couldn't connect after several attempts, log the error and throw an exception
-                    Log.Error(err);
-
-                    throw;
+                    // we need to tell the DefaultBrokerageMessageHandler we are connected else he will kill us
+                    OnReconnected("Connect() finished successfully");
                 }
-            }
-            _stateManager.IsConnecting = false;
-
-            // if we reached here we should be connected, check just in case
-            if (IsConnected)
-            {
-                _pastFirstConnection = true;
-                Log.Trace("InteractiveBrokersBrokerage.Connect(): Restoring data subscriptions...");
-                RestoreDataSubscriptions();
-
-                // we need to tell the DefaultBrokerageMessageHandler we are connected else he will kill us
-                OnReconnected("Connect() finished successfully");
-            }
-            else
-            {
-                OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, "ConnectionState", "Unexpected, not connected state. Unable to connect to Interactive Brokers. Terminating algorithm."));
+                else
+                {
+                    OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, "ConnectionState", "Unexpected, not connected state. Unable to connect to Interactive Brokers. Terminating algorithm."));
+                }
             }
         }
 
@@ -1117,6 +1127,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 // connecting can take minutes when it needs a 2FA confirmation
                 reason = "a connection attempt is in progress";
             }
+            else if (_stateManager.Disconnected1100Fired)
+            {
+                // the API socket is still up, TryWaitForReconnect owns the reporting and the recovery for it
+                reason = "IB reported a connectivity loss (error 1100)";
+            }
             else if (_ibAutomater.IsWithinScheduledServerResetTimes())
             {
                 reason = "within the IB scheduled server reset times";
@@ -1128,6 +1143,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             else if (IsRestartInProgress())
             {
                 reason = "a gateway restart is in progress";
+            }
+            else if (_gatewayRestartPending)
+            {
+                reason = "waiting for the scheduled restart after the gateway exited";
             }
 
             return reason != null;
@@ -5488,6 +5507,14 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 return;
             }
 
+            if (_stoppingGatewayForRestart)
+            {
+                // we stopped it ourselves to start a fresh one, that restart is already in flight
+                _stoppingGatewayForRestart = false;
+                Log.Trace("InteractiveBrokersBrokerage.OnIbAutomaterExited(): exit caused by our own restart, skipping.");
+                return;
+            }
+
             // check if IBGateway was closed because of an IBAutomater error, die if so
             var result = _ibAutomater.GetLastStartResult();
             if (IsRecuperable2FATimeout(result))
@@ -5514,6 +5541,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 var delay = GetWeeklyRestartDelay();
 
                 Log.Trace($"InteractiveBrokersBrokerage.OnIbAutomaterExited(): Delay before restart: {delay:d'd 'h'h 'm'm 's's'}");
+
+                // being disconnected until the restart runs is expected, the heart beat must not report it
+                _gatewayRestartPending = true;
 
                 Task.Delay(delay).ContinueWith(_ =>
                 {
@@ -5555,10 +5585,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                                 return;
                             }
 
-                            // the gateway is up but unusable, stop it so a new one is started below. This makes
-                            // IBAutomater report another exit, scheduling a recovery we do not need, it will
-                            // find us connected by then and skip
+                            // the gateway is up but unusable, stop it so a new one is started below. The exit
+                            // it reports is ours, the flag keeps it from scheduling a competing restart
                             Log.Trace("InteractiveBrokersBrokerage.OnIbAutomaterExited(): the gateway is not accepting connections, stopping it...");
+                            _stoppingGatewayForRestart = true;
                             _ibAutomater.Stop();
                         }
 
@@ -5576,6 +5606,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     catch (Exception exception)
                     {
                         OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, "IBAutomaterRestartError", exception.ToString()));
+                    }
+                    finally
+                    {
+                        // whatever the outcome, from here on a lost connection is no longer accounted for
+                        _gatewayRestartPending = false;
                     }
                 }, CancellationToken.None, TaskContinuationOptions.None, TaskScheduler.Default);
             }

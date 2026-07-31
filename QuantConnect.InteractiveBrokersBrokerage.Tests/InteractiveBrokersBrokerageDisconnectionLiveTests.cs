@@ -72,9 +72,9 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             var killer = new GatewayKiller(brokerage);
             try
             {
-                // the heart beat waits two minutes, then confirms with a six minute one before reporting, so
-                // the worst case is roughly ten minutes from the kill
-                Assert.IsTrue(disconnected.Wait(TimeSpan.FromMinutes(15)), "the lost connection was never reported");
+                // the exit schedules a restart five minutes out and the heart beat stays quiet until it has run,
+                // then waits two minutes and confirms with a six minute one, so the kill takes a while to surface
+                Assert.IsTrue(disconnected.Wait(TimeSpan.FromMinutes(20)), "the lost connection was never reported");
                 Assert.IsFalse(brokerage.IsConnected);
             }
             finally

@@ -20,7 +20,11 @@ using System.Reflection;
 using NUnit.Framework;
 using QuantConnect.Brokerages;
 using QuantConnect.Brokerages.InteractiveBrokers;
+using QuantConnect.Data.Market;
+using QuantConnect.Lean.Engine.TransactionHandlers;
 using QuantConnect.Orders;
+using QuantConnect.Tests.Engine;
+using QuantConnect.Tests.Engine.DataFeeds;
 
 namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 {
@@ -80,19 +84,30 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         // killed nightly.
         [TestCase("_isDisposeCalled", TestName = "HeartBeatStaysQuietWhileDisposing")]
         [TestCase("IsConnecting", TestName = "HeartBeatStaysQuietWhileConnecting")]
+        [TestCase("Disconnected1100Fired", TestName = "HeartBeatStaysQuietWhileIBReportsAConnectivityLoss")]
+        [TestCase("_gatewayRestartPending", TestName = "HeartBeatStaysQuietWhileWaitingForTheGatewayRestart")]
         public void HeartBeatDoesNotReportAnExpectedDisconnection(string expectedReasonField)
         {
             using var brokerage = new InteractiveBrokersBrokerage();
+            SetPrivateField(brokerage, "_ibAutomater", CreateInertAutomater());
 
-            if (expectedReasonField == "IsConnecting")
+            switch (expectedReasonField)
             {
-                // a connection attempt holds IsConnected false for as long as it runs, which is minutes when it
-                // needs a 2FA confirmation
-                GetStateManager(brokerage).IsConnecting = true;
-            }
-            else
-            {
-                SetPrivateField(brokerage, expectedReasonField, true);
+                case "IsConnecting":
+                    // a connection attempt holds IsConnected false for as long as it runs, which is minutes when
+                    // it needs a 2FA confirmation
+                    GetStateManager(brokerage).IsConnecting = true;
+                    break;
+
+                case "Disconnected1100Fired":
+                    // IsConnected is false while 1100 is pending even though the API socket is up, tearing it
+                    // down here would stop the 1101/1102 recovery from ever arriving
+                    GetStateManager(brokerage).Disconnected1100Fired = true;
+                    break;
+
+                default:
+                    SetPrivateField(brokerage, expectedReasonField, true);
+                    break;
             }
 
             Assert.IsFalse(InvokeIsConnected(brokerage));
@@ -138,11 +153,27 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 messages.Select(x => x.Type));
         }
 
-        // The transaction handler invalidates the order itself when PlaceOrder reports a failure, but only with a
-        // generic "Brokerage failed to place orders: [20]" that never says why. The brokerage invalidates it with
-        // the actual cause instead, and reports success so the same rejection is not raised twice.
+        // ...and a reset is not a reconnection: it runs on every gateway exit, so re-arming there would emit a
+        // disconnect per restart cycle and each one restarts the countdown the report exists to trigger.
         [Test]
-        public void PlaceOrderWhenDisconnectedInvalidatesTheOrderWithTheReason()
+        public void ResettingTheStateDoesNotReArmTheDisconnectReport()
+        {
+            using var brokerage = new InteractiveBrokersBrokerage();
+            var messages = new List<BrokerageMessageEvent>();
+            brokerage.Message += (_, message) => messages.Add(message);
+
+            InvokeOnDisconnected(brokerage, "lost");
+            GetStateManager(brokerage).Reset();
+            InvokeOnDisconnected(brokerage, "still lost");
+
+            Assert.AreEqual(1, messages.Count(x => x.Type == BrokerageMessageType.Disconnect));
+        }
+
+        // The transaction handler invalidates the order itself when PlaceOrder fails, but only with a generic
+        // "Brokerage failed to place orders: [20]" that never says why. It appends the exception message to it,
+        // so throwing is what carries the actual cause without reporting success for a rejected order.
+        [Test]
+        public void PlaceOrderWhenDisconnectedThrowsWithTheReason()
         {
             using var brokerage = new InteractiveBrokersBrokerage();
             var messages = new List<BrokerageMessageEvent>();
@@ -153,14 +184,59 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             Assert.IsFalse(brokerage.IsConnected);
 
             var order = new MarketOrder(Symbols.SPY, -19454, DateTime.UtcNow);
-            brokerage.PlaceOrder(order);
+            var exception = Assert.Throws<InvalidOperationException>(() => brokerage.PlaceOrder(order));
 
-            var invalidated = orderEvents.Single();
-            Assert.AreEqual(OrderStatus.Invalid, invalidated.Status);
-            Assert.AreEqual(order.Id, invalidated.OrderId);
-            Assert.AreEqual("Orders cannot be submitted when disconnected.", invalidated.Message);
+            Assert.AreEqual("Orders cannot be submitted when disconnected.", exception.Message);
+            // the transaction handler raises the single invalid order event, we must not raise a duplicate
+            CollectionAssert.IsEmpty(orderEvents);
             // the brokerage level warning is still raised, it is what support greps for by code
             Assert.AreEqual(1, messages.Count(x => x.Code == "PlaceOrderWhenDisconnected"));
+        }
+
+        // ...and the throw above is only worth anything if the transaction handler carries the reason out to the
+        // ticket, which is what the algorithm actually reads. Drives the real handler to prove the round trip.
+        [Test]
+        public void PlaceOrderWhenDisconnectedReportsTheReasonOnTheTicket()
+        {
+            var algorithm = new AlgorithmStub();
+            var equity = algorithm.AddEquity("SPY");
+            equity.SetMarketPrice(new Tick { Value = 100m });
+            algorithm.SetFinishedWarmingUp();
+
+            // the parameterless constructor skips the subscription validation, PlaceOrder only needs IsConnected
+            using var brokerage = new InteractiveBrokersBrokerage();
+            Assert.IsFalse(brokerage.IsConnected);
+
+            var transactionHandler = new SynchronousTransactionHandler();
+            transactionHandler.Initialize(algorithm, brokerage, new TestResultHandler());
+            algorithm.Transactions.SetOrderProcessor(transactionHandler);
+
+            try
+            {
+                var request = new SubmitOrderRequest(OrderType.Market, equity.Symbol.SecurityType, equity.Symbol, 1m, 0, 0,
+                    DateTime.UtcNow, string.Empty);
+                algorithm.Transactions.SetOrderId(request);
+
+                var ticket = transactionHandler.Process(request);
+                // the queue is drained by the engine loop, which is not running here
+                transactionHandler.HandleOrderRequest(request);
+
+                Assert.AreEqual(OrderStatus.Invalid, ticket.Status);
+                Assert.IsTrue(ticket.SubmitRequest.Response.IsError, "a rejected order must not report a successful response");
+                StringAssert.Contains("Orders cannot be submitted when disconnected.", ticket.SubmitRequest.Response.ErrorMessage);
+            }
+            finally
+            {
+                transactionHandler.Exit();
+            }
+        }
+
+        /// <summary>
+        /// No worker threads, so the request is only ever processed by the explicit HandleOrderRequest call above.
+        /// </summary>
+        private class SynchronousTransactionHandler : BrokerageTransactionHandler
+        {
+            protected override bool SynchronousProcessing => true;
         }
 
         /// <summary>

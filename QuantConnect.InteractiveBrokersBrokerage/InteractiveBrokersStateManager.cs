@@ -106,7 +106,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         {
             _disconnected1100Fired = false;
             _previouslyInResetTime = false;
-            _disconnectReported = false;
+            // _disconnectReported is not cleared here on purpose, only an actual reconnection re-arms it:
+            // a disconnect per gateway restart cycle would keep deferring the message handler shutdown
             _connectingInProgress.Reset();
         }
     }
