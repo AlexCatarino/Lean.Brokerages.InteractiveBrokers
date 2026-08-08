@@ -544,7 +544,15 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
                     if (!eventSlim.Wait(_responseTimeout))
                     {
-                        OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, "NoBrokerageResponse", $"Timeout waiting for brokerage response for brokerage order id {orderId} lean id {order.Id}"));
+                        if (_pendingOrderResponse.TryRemove(orderId, out _))
+                        {
+                            eventSlim.DisposeSafely();
+
+                            // IB holds the ack when it cannot act on the cancellation yet (order queued outside
+                            // regular trading hours, exchange session break): warn and carry on, the ack arrives on its own
+                            OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "NoBrokerageResponse",
+                                $"Timeout waiting for brokerage response for cancellation of brokerage order id {orderId} lean id {order.Id}"));
+                        }
                     }
                     else
                     {
