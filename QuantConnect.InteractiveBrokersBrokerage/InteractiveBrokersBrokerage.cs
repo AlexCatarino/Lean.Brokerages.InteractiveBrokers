@@ -160,6 +160,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         // tracks pending brokerage order responses. In some cases we've seen orders been placed and they never get through to IB
         private readonly ConcurrentDictionary<int, ManualResetEventSlim> _pendingOrderResponse = new();
 
+        // time of the last detected gateway restart, to explain response timeouts of requests the restart raced
+        private DateTime _lastGatewayRestartTimeUtc;
+
         // On a Financial Advisor account IBGateway confirms the first order of a deployment with a warning
         // dialog and silently drops every other order that reaches it while that dialog is unanswered,
         // so the first order goes alone
@@ -1587,6 +1590,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
             var isFirstFinancialAdvisorOrder = WaitForFinancialAdvisorFirstOrder();
 
+            var requestTimeUtc = DateTime.UtcNow;
             int ibOrderId;
             ManualResetEventSlim orderSubmittedEvent = null;
 
@@ -1671,7 +1675,13 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         }
                         else
                         {
-                            OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, "NoBrokerageResponse", $"Timeout waiting for brokerage response for brokerage order id {ibOrderId} lean id {order.Id}"));
+                            var reason = $"Timeout waiting for brokerage response for brokerage order id {ibOrderId} lean id {order.Id}";
+                            if (_lastGatewayRestartTimeUtc >= requestTimeUtc || IsRestartInProgress())
+                            {
+                                reason += ". An IB Gateway restart overlapped the request, which likely never reached IB. " +
+                                    "Consider avoiding order requests around the gateway's scheduled restart time.";
+                            }
+                            OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, "NoBrokerageResponse", reason));
                         }
                     }
                     else
@@ -5555,6 +5565,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private void OnIbAutomaterRestarted(object sender, EventArgs e)
         {
             Log.Trace("InteractiveBrokersBrokerage.OnIbAutomaterRestarted()");
+
+            _lastGatewayRestartTimeUtc = DateTime.UtcNow;
 
             _stateManager.Reset();
             StopGatewayRestartTask();
